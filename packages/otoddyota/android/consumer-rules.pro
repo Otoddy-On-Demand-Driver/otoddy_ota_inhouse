@@ -1,0 +1,4 @@
+-keep class io.flutter.FlutterInjector { *; }
+-keep class io.flutter.FlutterInjector$* { *; }
+-keep class io.flutter.embedding.engine.loader.FlutterLoader { *; }
+-keep class com.otoddy.otoddyota.** { *; }

@@ -7,6 +7,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:restart_app/restart_app.dart';
 
 /// Callback when a patch is downloaded and ready to apply on next launch.
 typedef PatchDownloadedCallback = void Function(int patchNumber);
@@ -73,7 +74,7 @@ class OtoddyOTA {
   /// Manually check and download updates.
   static Future<bool> checkForUpdate() async {
     if (!_initialized) {
-      debugPrint('[InhouseCodePush] Error: init() must be called before checkForUpdate()');
+      debugPrint('[OtoddyOTA] Error: init() must be called before checkForUpdate()');
       return false;
     }
     return _runCheck();
@@ -89,6 +90,15 @@ class OtoddyOTA {
       }
     } catch (_) {}
     return null;
+  }
+
+  /// Restarts the Android application so a downloaded patch is loaded.
+  static Future<void> restartApp() async {
+    await Restart.restartApp(
+      forceKill: true,
+      notificationTitle: 'Update successful',
+      notificationBody: 'The app has been updated. Restarting...',
+    );
   }
 
   static String get _arch {
@@ -119,11 +129,11 @@ class OtoddyOTA {
           final success = await _tryBase(base, current, patchDir, numberFile);
           if (success) return true;
         } catch (e) {
-          debugPrint('[InhouseCodePush] $base unreachable: $e');
+          debugPrint('[OtoddyOTA] $base unreachable: $e');
         }
       }
     } catch (e) {
-      debugPrint('[InhouseCodePush] Check failed: $e');
+      debugPrint('[OtoddyOTA] Check failed: $e');
     }
     return false;
   }
@@ -136,10 +146,7 @@ class OtoddyOTA {
   ) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 4);
     try {
-      final checkReq = await client.postUrl(Uri.parse('$base/api/v1/patches/check'));
-      checkReq.headers.contentType = ContentType.json;
-      checkReq.headers.set('ngrok-skip-browser-warning', '1');
-      checkReq.add(utf8.encode(jsonEncode({
+      final payload = jsonEncode({
         'app_id': _appId,
         'release_version': _releaseVersion,
         'platform': 'android',
@@ -147,9 +154,32 @@ class OtoddyOTA {
         'channel': _channel,
         'client_id': 'device',
         'current_patch_number': current,
-      })));
+      });
 
-      final checkResp = await checkReq.close();
+      Uri checkUri;
+      if (base.endsWith('/patches/check')) {
+        checkUri = Uri.parse(base);
+      } else if (base.endsWith('/ota')) {
+        checkUri = Uri.parse('$base/patches/check');
+      } else {
+        checkUri = Uri.parse('$base/api/v1/ota/patches/check');
+      }
+
+      var checkReq = await client.postUrl(checkUri);
+      checkReq.headers.contentType = ContentType.json;
+      checkReq.headers.set('ngrok-skip-browser-warning', '1');
+      checkReq.add(utf8.encode(payload));
+
+      var checkResp = await checkReq.close();
+      if (checkResp.statusCode == HttpStatus.notFound && !checkUri.path.endsWith('/api/v1/patches/check')) {
+        final fallbackUri = Uri.parse('$base/api/v1/patches/check');
+        checkReq = await client.postUrl(fallbackUri);
+        checkReq.headers.contentType = ContentType.json;
+        checkReq.headers.set('ngrok-skip-browser-warning', '1');
+        checkReq.add(utf8.encode(payload));
+        checkResp = await checkReq.close();
+      }
+
       if (checkResp.statusCode != HttpStatus.ok) return false;
 
       final body = jsonDecode(await checkResp.transform(utf8.decoder).join())
@@ -160,39 +190,48 @@ class OtoddyOTA {
           ?.map((e) => (e as num).toInt())
           .toSet();
       if (current != null && rolledBackList != null && rolledBackList.contains(current)) {
-        debugPrint('[InhouseCodePush] Patch #$current was revoked remotely! Reverting to baseline...');
+        debugPrint('[OtoddyOTA] Patch #$current was revoked remotely! Reverting to baseline...');
         final currentPatchFile = File('${patchDir.path}/libapp.so');
         if (currentPatchFile.existsSync()) currentPatchFile.deleteSync();
         if (numberFile.existsSync()) numberFile.deleteSync();
+        _onPatchReady?.call(0);
         return true;
       }
 
       if (body['patch_available'] != true) {
-        debugPrint('[InhouseCodePush] Up to date via $base (current=$current)');
-        return true;
+        debugPrint('[OtoddyOTA] Up to date via $base (current=$current)');
+        return false;
       }
 
       final patch = body['patch'] as Map<String, dynamic>;
       final number = (patch['number'] as num).toInt();
-      if (current != null && number <= current) return true;
+      if (current != null && number <= current) {
+        debugPrint('[OtoddyOTA] Already on patch #$current (latest is #$number)');
+        return false;
+      }
 
-      final path = Uri.parse(patch['download_url'] as String).path;
-      final url = '$base$path';
-      debugPrint('[InhouseCodePush] Downloading patch #$number from $url');
+      final rawDownloadUrl = patch['download_url'] as String;
+      final url = (rawDownloadUrl.startsWith('http://') || rawDownloadUrl.startsWith('https://'))
+          ? rawDownloadUrl
+          : '$base${Uri.parse(rawDownloadUrl).path}';
+      debugPrint('[OtoddyOTA] Downloading patch #$number from $url');
 
       await patchDir.create(recursive: true);
       final tmp = File('${patchDir.path}/libapp.so.tmp');
       final dlReq = await client.getUrl(Uri.parse(url));
       dlReq.headers.set('ngrok-skip-browser-warning', '1');
       final dlResp = await dlReq.close();
-      if (dlResp.statusCode != HttpStatus.ok) return true;
+      if (dlResp.statusCode != HttpStatus.ok) {
+        debugPrint('[OtoddyOTA] Download failed with status ${dlResp.statusCode}');
+        return false;
+      }
 
       final sink = tmp.openWrite();
       await dlResp.pipe(sink);
       await tmp.rename('${patchDir.path}/libapp.so');
       await numberFile.writeAsString('$number');
 
-      debugPrint('[InhouseCodePush] Installed patch #$number via $base -> will apply on next launch');
+      debugPrint('[OtoddyOTA] Installed patch #$number via $base -> will apply on next launch');
       _onPatchReady?.call(number);
       return true;
     } finally {

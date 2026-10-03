@@ -68,7 +68,9 @@ void main() {
     appId: 'com.yourcompany.yourapp',
     releaseVersion: '1.0.0', // Must match installed base release
     onPatchReady: (patchNumber) {
-      debugPrint('==> New OtoddyOTA patch #$patchNumber ready for next restart!');
+      debugPrint('==> New OtoddyOTA patch #$patchNumber ready!');
+      // Prompt user or automatically restart app to load the new patch:
+      OtoddyOTA.restartApp();
     },
   );
 
@@ -80,11 +82,15 @@ void main() {
 
 ## ⚙️ Android Setup
 
-### 1. Add Internet Permission
+### Zero Native Configuration!
+`otoddyota` is a zero-config Flutter plugin. It embeds an internal Android `InitProvider` (`OtoddyInitProvider`) that automatically registers the patch loader with the Flutter engine before the engine boots. **No custom code in `MainActivity.kt` or `AndroidManifest.xml` is required!**
+
+### 1. Ensure Internet Permission
 In `android/app/src/main/AndroidManifest.xml`:
 ```xml
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
+```
 ```
 
 ### 2. Configure Hooked Engine Repository
@@ -99,6 +105,53 @@ if (localEngineMaven != null) {
     }
 }
 ```
+
+---
+
+## 🌐 Backend Protocol Specification (Self-Hosting Your Server)
+
+`otoddyota` is completely server-agnostic. Any backend server (Node.js, Go, Python, Dart, etc.) can be used with this package by implementing the following wire protocol:
+
+### 1. Patch Check Endpoint
+- **Method**: `POST`
+- **Path**: `/api/v1/patches/check`
+- **Request Body (JSON)**:
+  ```json
+  {
+    "app_id": "com.example.app",
+    "release_version": "1.0.0",
+    "platform": "android",
+    "arch": "arm64",
+    "channel": "stable",
+    "client_id": "device",
+    "current_patch_number": 0
+  }
+  ```
+- **Response when update is available (HTTP 200)**:
+  ```json
+  {
+    "patch_available": true,
+    "patch": {
+      "number": 1,
+      "hash": "<sha256-hash-of-snapshot>",
+      "download_url": "https://yourdomain.com/patches/download/patch_1.so"
+    },
+    "rolled_back_patch_numbers": null
+  }
+  ```
+- **Response when app is up-to-date (HTTP 200)**:
+  ```json
+  {
+    "patch_available": false,
+    "rolled_back_patch_numbers": null
+  }
+  ```
+- **Emergency Rollback**: If a patch number is included in `rolled_back_patch_numbers`, the client instantly deletes that patch from local storage and falls back to the APK baseline.
+
+### 2. Patch Download Endpoint
+- **Method**: `GET`
+- **Path**: The `download_url` returned from the check endpoint.
+- **Response**: Streams the compiled `libapp.so` binary file (`Content-Type: application/octet-stream`).
 
 ---
 

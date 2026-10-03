@@ -1,1 +1,32 @@
-#
+# Environment files (NEVER commit secrets or personal URLs)
+.env
+*.env
+!.env.example
+!tooling/config.env
+tooling/config.local.env
+
+# Binary artifacts & patches
+server/_patches/
+*.apk
+*.so
+*.aab
+*.bin
+
+# Dart & Flutter build / tools
+.dart_tool/
+**/.dart_tool/
+build/
+**/build/
+.packages
+.pub-cache/
+.pub/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db

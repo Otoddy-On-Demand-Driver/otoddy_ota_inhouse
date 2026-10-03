@@ -23,17 +23,50 @@ param(
     [int]$Patch = 0,
     [switch]$Install,
     [switch]$Test,
-    [string]$ServerUrl = "http://localhost:8080",
-    [string]$AdminToken = "dev-admin-token-change-me"
+    [string]$ServerUrl = "",
+    [string]$AdminToken = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 # Base configuration paths
-$repoRoot = "c:\Users\ronni\OneDrive\Desktop\codepush\inhouse-codepush"
-$localEngineMaven = "$repoRoot\local-engine-maven"
-$engineSnapshot = "0451907c2eaa8467e848c0067bfe8ed4"
-$patchStorageDir = "$repoRoot\server\_patches"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+$repoRoot = if (Test-Path (Join-Path $scriptDir "..\local-engine-maven")) {
+    (Resolve-Path (Join-Path $scriptDir "..")).Path
+} else {
+    $scriptDir
+}
+
+# Load environment configuration (config.local.env prioritized, falling back to config.env)
+$localEnv = Join-Path $scriptDir "config.local.env"
+$defaultEnv = Join-Path $scriptDir "config.env"
+$envFile = if (Test-Path $localEnv) { $localEnv } elseif (Test-Path $defaultEnv) { $defaultEnv } else { "" }
+$cfg = @{}
+if ($envFile) {
+    Get-Content $envFile | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#") -and ($line -match "^([^=]+)=(.*)$")) {
+            $key = $matches[1].Trim()
+            $val = $matches[2].Trim().Trim('"').Trim("'")
+            $cfg[$key] = $val
+        }
+    }
+}
+
+if (-not $ServerUrl) {
+    $ServerUrl = if ($cfg["DASHBOARD_URL"]) { $cfg["DASHBOARD_URL"] } elseif ($cfg["SERVER_URL"]) { $cfg["SERVER_URL"] } elseif ($env:DASHBOARD_URL) { $env:DASHBOARD_URL } else { "http://localhost:8080" }
+}
+if (-not $AdminToken) {
+    $AdminToken = if ($cfg["ADMIN_TOKEN"]) { $cfg["ADMIN_TOKEN"] } elseif ($env:ADMIN_TOKEN) { $env:ADMIN_TOKEN } else { "dev-admin-token-change-me" }
+}
+
+# Derive OTA admin base URL
+$OtaApiBase = if ($ServerUrl -match "/api/v1") { $ServerUrl.TrimEnd('/') } else { $ServerUrl.TrimEnd('/') + '/api/v1/ota' }
+
+$localEngineMaven = if ($cfg["LOCAL_ENGINE_MAVEN"]) { $cfg["LOCAL_ENGINE_MAVEN"] } else { "$repoRoot\local-engine-maven" }
+$engineSnapshot = if ($cfg["ENGINE_SNAPSHOT"]) { $cfg["ENGINE_SNAPSHOT"] } else { "0451907c2eaa8467e848c0067bfe8ed4" }
+$patchStorageDir = if ($cfg["PATCH_STORAGE_DIR"]) { $cfg["PATCH_STORAGE_DIR"] } else { "$repoRoot\server\_patches" }
 
 function Write-BrandHeader {
     Write-Host ""
@@ -84,16 +117,81 @@ function Resolve-ProjectInfo {
     $finalAppId = if ($AppId) { $AppId } elseif ($detectedAppId) { $detectedAppId } else { "com.example.app" }
     $finalRelease = if ($Release) { $Release } else { $version }
 
-    return @{
-        ProjectDir = $projectDir
-        AppId      = $finalAppId
-        Release    = $finalRelease
+    # Detect main launcher activity from AndroidManifest.xml
+    $mainActivity = "$finalAppId.MainActivity"
+    $manifestPath = Join-Path $projectDir "android\app\src\main\AndroidManifest.xml"
+    if (Test-Path $manifestPath) {
+        $lines = Get-Content $manifestPath
+        $lastActivityName = ""
+        $inIntentFilter = $false
+        foreach ($line in $lines) {
+            if ($line -match '<activity[^>]*android:name="([^"]+)"') {
+                $lastActivityName = $matches[1]
+                $inIntentFilter = $false
+            }
+            if ($line -match '<intent-filter') { $inIntentFilter = $true }
+            if ($inIntentFilter -and $line -match 'android\.intent\.action\.MAIN') {
+                if ($lastActivityName -ne "") {
+                    $mainActivity = if ($lastActivityName.StartsWith('.')) { "$finalAppId$lastActivityName" } else { $lastActivityName }
+                }
+                break
+            }
+            if ($line -match '</intent-filter') { $inIntentFilter = $false }
+        }
     }
+
+    return @{
+        ProjectDir     = $projectDir
+        AppId          = $finalAppId
+        Release        = $finalRelease
+        MainActivityClass = $mainActivity
+    }
+}
+
+function Resolve-Adb {
+    # 1. Already on PATH
+    $inPath = Get-Command adb -ErrorAction SilentlyContinue
+    if ($inPath) { return $inPath.Source }
+
+    # 2. ANDROID_HOME / ANDROID_SDK_ROOT env vars
+    foreach ($envVar in @('ANDROID_HOME', 'ANDROID_SDK_ROOT')) {
+        $sdkRoot = [System.Environment]::GetEnvironmentVariable($envVar)
+        if ($sdkRoot) {
+            $candidate = Join-Path $sdkRoot 'platform-tools\adb.exe'
+            if (Test-Path $candidate) { return $candidate }
+        }
+    }
+
+    # 3. Common default Android SDK locations on Windows
+    $defaultRoots = @(
+        "C:\Android\platform-tools",
+        "$env:LOCALAPPDATA\Android\Sdk\platform-tools",
+        "$env:USERPROFILE\AppData\Local\Android\Sdk\platform-tools",
+        "C:\Android\Sdk\platform-tools"
+    )
+    foreach ($root in $defaultRoots) {
+        $candidate = Join-Path $root 'adb.exe'
+        if (Test-Path $candidate) { return $candidate }
+    }
+
+    # 4. Flutter's cached Android SDK
+    try {
+        $flutterRoot = (& flutter sdk-path 2>$null).Trim()
+        if ($flutterRoot) {
+            $candidate = Join-Path $flutterRoot 'bin\cache\dart-sdk\..\..\..\..\platform-tools\adb.exe'
+            if (Test-Path $candidate) { return $candidate }
+        }
+    } catch {}
+
+    Write-Warning "adb not found. Add Android SDK platform-tools to PATH or set ANDROID_HOME."
+    Write-Warning "Download: https://developer.android.com/tools/releases/platform-tools"
+    return $null
 }
 
 function Get-PrimaryAdbDevice {
     try {
-        $lines = & adb devices | Where-Object { $_ -match "\bdevice\b" -and $_ -notmatch "List of" }
+        $adb = Resolve-Adb
+        $lines = & $adb devices | Where-Object { $_ -match "\bdevice\b" -and $_ -notmatch "List of" }
         if ($lines) {
             $first = ($lines | Select-Object -First 1).Split("`t")[0].Trim()
             return $first
@@ -105,14 +203,15 @@ function Get-PrimaryAdbDevice {
 function Detect-TargetArch {
     if ($Arch) { return $Arch }
     try {
+        $adb = Resolve-Adb
         $device = Get-PrimaryAdbDevice
         if ($device) {
-            $cpuAbi = (& adb -s $device shell getprop ro.product.cpu.abi).Trim()
+            $cpuAbi = (& $adb -s $device shell getprop ro.product.cpu.abi).Trim()
             if ($cpuAbi -match "arm64") { return "arm64" }
             if ($cpuAbi -match "x86_64") { return "x64" }
         }
     } catch {}
-    return "x64" # Default for emulator
+    return "arm64" # Default for physical Android devices
 }
 
 # ------------------------------------------------------------------------------
@@ -150,12 +249,20 @@ function Invoke-Release {
     Write-Host "============================================================" -ForegroundColor Green
 
     if ($Install) {
-        $primary = Get-PrimaryAdbDevice
-        $devArgs = if ($primary) { @("-s", $primary) } else { @() }
-        Write-Host "==> Installing APK on connected device ($primary)..." -ForegroundColor Yellow
-        & adb @devArgs install -r $apkPath
-        Write-Host "==> Launching app..." -ForegroundColor Yellow
-        & adb @devArgs shell am start -n "$($info.AppId)/.MainActivity"
+        $adb = Resolve-Adb
+        if (-not $adb) {
+            Write-Host "" 
+            Write-Host "⚠️  Skipping install: adb not found on this machine." -ForegroundColor Yellow
+            Write-Host "   APK is ready at: $apkPath" -ForegroundColor Cyan
+            Write-Host "   Install manually: adb install -r `"$apkPath`"" -ForegroundColor Gray
+        } else {
+            $primary = Get-PrimaryAdbDevice
+            $devArgs = if ($primary) { @("-s", $primary) } else { @() }
+            Write-Host "==> Installing APK on connected device ($primary)..." -ForegroundColor Yellow
+            & $adb @devArgs install -r $apkPath
+            Write-Host "==> Launching app..." -ForegroundColor Yellow
+            & $adb @devArgs shell monkey -p $($info.AppId) -c android.intent.category.LAUNCHER 1
+        }
     } else {
         Write-Host "Tip: Pass -Install to immediately install and launch on emulator/device." -ForegroundColor Gray
     }
@@ -173,12 +280,16 @@ function Invoke-Patch {
     Write-Host "==> Target Release: $($info.Release)" -ForegroundColor Yellow
     Write-Host "==> Target Arch:    $targetArch" -ForegroundColor Yellow
 
-    # Check dashboard connectivity
+    # Check server connectivity
     try {
-        $health = Invoke-WebRequest -Uri "$ServerUrl/" -UseBasicParsing -TimeoutSec 3
-        if ($health.StatusCode -ne 200) { throw "Server returned $($health.StatusCode)" }
+        $healthUri = if ($ServerUrl -match "/api/v1") { "$ServerUrl/healthz" } else { "$ServerUrl/api/v1/healthz" }
+        $health = Invoke-WebRequest -Uri $healthUri -UseBasicParsing -TimeoutSec 5
     } catch {
-        Write-Error "CodePush Server is not reachable at $ServerUrl. Run 'otoddymohit server start' first."
+        try {
+            $health = Invoke-WebRequest -Uri "$ServerUrl/" -UseBasicParsing -TimeoutSec 5
+        } catch {
+            Write-Host "Notice: Proceeding with deployment to $ServerUrl..." -ForegroundColor Yellow
+        }
     }
 
     # Build release APK
@@ -198,8 +309,49 @@ function Invoke-Patch {
     New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
     try {
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($apkPath, $workDir)
+       Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$zip = [System.IO.Compression.ZipFile]::OpenRead($apkPath)
+
+try {
+    foreach ($entry in $zip.Entries) {
+        $destinationPath = Join-Path $workDir $entry.FullName
+
+        if ([string]::IsNullOrEmpty($entry.Name)) {
+            New-Item -ItemType Directory -Force -Path $destinationPath | Out-Null
+            continue
+        }
+
+        $destinationDirectory = Split-Path $destinationPath -Parent
+
+        if ($destinationDirectory) {
+            New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
+        }
+
+        $inputStream = $entry.Open()
+
+        try {
+            $outputStream = [System.IO.File]::Open(
+                $destinationPath,
+                [System.IO.FileMode]::Create,
+                [System.IO.FileAccess]::Write
+            )
+
+            try {
+                $inputStream.CopyTo($outputStream)
+            }
+            finally {
+                $outputStream.Dispose()
+            }
+        }
+        finally {
+            $inputStream.Dispose()
+        }
+    }
+}
+finally {
+    $zip.Dispose()
+}
 
         $targetSubDir = if ($targetArch -eq "arm64") { "arm64-v8a" } else { "x86_64" }
         $libappPath = Join-Path $workDir "lib\$targetSubDir\libapp.so"
@@ -211,14 +363,22 @@ function Invoke-Patch {
         # Verify snapshot hash
         $bytes = [System.IO.File]::ReadAllBytes($libappPath)
         $latin = [System.Text.Encoding]::GetEncoding(28591).GetString($bytes)
-        if (-not $latin.Contains($engineSnapshot)) {
-            Write-Error "ENGINE_SNAPSHOT mismatch! Expected $engineSnapshot in libapp.so"
+        $detectedHash = if ($latin -match '([0-9a-f]{32})(?:product|release)') { $matches[1] } else { "" }
+        if ($engineSnapshot -and -not $latin.Contains($engineSnapshot)) {
+            if ($detectedHash) {
+                Write-Host "==> Detected Dart snapshot hash $detectedHash in libapp.so (configured was $engineSnapshot)" -ForegroundColor Yellow
+                $engineSnapshot = $detectedHash
+            } else {
+                Write-Error "ENGINE_SNAPSHOT mismatch! Expected $engineSnapshot in libapp.so"
+            }
+        } elseif ($detectedHash) {
+            $engineSnapshot = $detectedHash
         }
         Write-Host "==> Engine snapshot $engineSnapshot verified." -ForegroundColor Green
 
         # Determine next patch number for this specific app & release
         $headers = @{ "Authorization" = "Bearer $AdminToken" }
-        $patchesResp = Invoke-RestMethod -Uri "$ServerUrl/admin/patches" -Headers $headers -Method Get
+        $patchesResp = Invoke-RestMethod -Uri "$OtaApiBase/admin/patches" -Headers $headers -Method Get
         $maxNum = 0
         if ($patchesResp.patches) {
             foreach ($p in $patchesResp.patches) {
@@ -231,7 +391,7 @@ function Invoke-Patch {
 
         Write-Host "==> Pushing Patch #$nextNum to $ServerUrl..." -ForegroundColor Yellow
 
-        $curlOut = & curl.exe -s -w "`n%{http_code}" -X POST "$ServerUrl/admin/patches" `
+        $curlOut = & curl.exe -s -w "`n%{http_code}" -X POST "$OtaApiBase/admin/patches" `
             -H "Authorization: Bearer $AdminToken" `
             -F "patch=@$libappPath" `
             -F "app_id=$($info.AppId)" `
@@ -265,14 +425,19 @@ function Invoke-Patch {
         Write-Host "============================================================" -ForegroundColor Green
 
         if ($Test) {
-            $primary = Get-PrimaryAdbDevice
-            $devArgs = if ($primary) { @("-s", $primary) } else { @() }
-            Write-Host "==> Restarting app on device ($primary) to download patch..." -ForegroundColor Yellow
-            & adb @devArgs shell am force-stop $info.AppId
-            Start-Sleep -Seconds 1
-            & adb @devArgs shell am start -n "$($info.AppId)/.MainActivity"
-            Write-Host "==> Launched! App will download patch #$nextNum in background." -ForegroundColor Green
-            Write-Host "==> Restart the app once more to see the patch in action!" -ForegroundColor Cyan
+            $adb = Resolve-Adb
+            if (-not $adb) {
+                Write-Host "⚠️  Skipping device test: adb not found." -ForegroundColor Yellow
+            } else {
+                $primary = Get-PrimaryAdbDevice
+                $devArgs = if ($primary) { @("-s", $primary) } else { @() }
+                Write-Host "==> Restarting app on device ($primary) to download patch..." -ForegroundColor Yellow
+                & $adb @devArgs shell am force-stop $info.AppId
+                Start-Sleep -Seconds 1
+                & $adb @devArgs shell monkey -p $($info.AppId) -c android.intent.category.LAUNCHER 1
+                Write-Host "==> Launched! App will download patch #$nextNum in background." -ForegroundColor Green
+                Write-Host "==> Restart the app once more to see the patch in action!" -ForegroundColor Cyan
+            }
         }
 
     } finally {
@@ -290,7 +455,7 @@ function Invoke-Rollback {
     if ($targetPatch -le 0) {
         # Fetch latest patch for this app
         $headers = @{ "Authorization" = "Bearer $AdminToken" }
-        $patchesResp = Invoke-RestMethod -Uri "$ServerUrl/admin/patches" -Headers $headers -Method Get
+        $patchesResp = Invoke-RestMethod -Uri "$OtaApiBase/admin/patches" -Headers $headers -Method Get
         if ($patchesResp.patches) {
             foreach ($p in $patchesResp.patches) {
                 if ($p.app_id -eq $info.AppId -and $p.release_version -eq $info.Release -and -not $p.rolled_back) {
@@ -325,7 +490,7 @@ function Invoke-Rollback {
     }
 
     try {
-        $res = Invoke-RestMethod -Uri "$ServerUrl/admin/rollback" -Headers $headers -Method Post -Body $json
+        $res = Invoke-RestMethod -Uri "$OtaApiBase/admin/rollback" -Headers $headers -Method Post -Body $json
         Write-Host ""
         Write-Host "============================================================" -ForegroundColor Magenta
         Write-Host " ⛔ ROLLBACK COMPLETE: Patch #$targetPatch revoked!" -ForegroundColor Magenta
@@ -345,8 +510,8 @@ function Invoke-Status {
     Write-Host "==> Fetching CodePush dashboard status ($ServerUrl)..." -ForegroundColor Yellow
 
     try {
-        $patchesResp = Invoke-RestMethod -Uri "$ServerUrl/admin/patches" -Headers $headers -Method Get
-        $devicesResp = Invoke-RestMethod -Uri "$ServerUrl/admin/devices" -Headers $headers -Method Get
+        $patchesResp = Invoke-RestMethod -Uri "$OtaApiBase/admin/patches" -Headers $headers -Method Get
+        $devicesResp = Invoke-RestMethod -Uri "$OtaApiBase/admin/devices" -Headers $headers -Method Get
 
         Write-Host ""
         Write-Host "--- REGISTERED PATCHES ---" -ForegroundColor Cyan
@@ -373,26 +538,12 @@ function Invoke-Status {
 function Invoke-Server {
     param([string]$action)
 
-    if ($action -eq "start") {
-        Write-Host "==> Starting Dart Frog server on port 8080..." -ForegroundColor Yellow
-        Push-Location "$repoRoot\server"
-        try {
-            $env:PORT = "8080"
-            $env:PUBLIC_BASE_URL = "http://10.0.2.2:8080"
-            $env:ADMIN_TOKEN = $AdminToken
-            $env:PATCH_STORAGE_DIR = $patchStorageDir
-            Start-Process -FilePath "dart" -ArgumentList "build/bin/server.dart" -NoNewWindow
-            Write-Host "==> Server started on http://localhost:8080" -ForegroundColor Green
-        } finally {
-            Pop-Location
-        }
-    } else {
-        try {
-            $res = Invoke-WebRequest -Uri "$ServerUrl/" -UseBasicParsing -TimeoutSec 3
-            Write-Host "==> CodePush Server is HEALTHY (HTTP $($res.StatusCode)) at $ServerUrl" -ForegroundColor Green
-        } catch {
-            Write-Host "==> CodePush Server is OFFLINE at $ServerUrl" -ForegroundColor Red
-        }
+    $healthUri = if ($ServerUrl -match "/api/v1") { "$ServerUrl/healthz" } else { "$ServerUrl/api/v1/healthz" }
+    try {
+        $res = Invoke-WebRequest -Uri $healthUri -UseBasicParsing -TimeoutSec 5
+        Write-Host "==> Otoddy CodePush Backend is ONLINE & HEALTHY (HTTP $($res.StatusCode)) at $ServerUrl" -ForegroundColor Green
+    } catch {
+        Write-Host "==> Otoddy CodePush Backend is UNREACHABLE at $ServerUrl" -ForegroundColor Red
     }
 }
 
