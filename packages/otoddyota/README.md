@@ -14,7 +14,7 @@ Deliver instant Dart bug fixes, UI updates, and feature enhancements to your use
 **[OTODDY](https://otoddy.com)** is a product-focused technology company building software products, digital platforms, and developer technologies that solve real-world problems. We create scalable, reliable, and user-centric technology across mobility, healthcare, business software, and emerging digital domains.
 
 * **Website**: [https://otoddy.com](https://otoddy.com)
-* **GitHub**: [https://github.com/MohitMakhijani/otoddy_ota_inhouse](https://github.com/MohitMakhijani/otoddy_ota_inhouse)
+* **GitHub**: [https://github.com/Otoddy-On-Demand-Driver/otoddy_ota_inhouse](https://github.com/Otoddy-On-Demand-Driver/otoddy_ota_inhouse)
 
 ---
 
