@@ -1,3 +1,9 @@
+## 1.0.5
+
+* **Automatic Stale Patch Invalidation**: Detects base APK/AAB updates via `versionCode`, `lastUpdateTime`, or release version changes and automatically purges old patches so new store releases load cleanly.
+* **Release Version Tracking**: Stores `release_version` with downloaded patches to ensure patches are only applied to their matching baseline release.
+* **Updated Repository Links**: Pointed repository and issue tracker URLs to `Otoddy-On-Demand-Driver/otoddy_ota_inhouse`.
+
 ## 1.0.4
 
 * **Zero-Config Android Integration**: Added `OtoddyInitProvider` and `OtoddyFlutterLoader` plugin components to automatically inject `--aot-shared-library-name` into Flutter's initialization without requiring any custom native code or changes to `MainActivity.kt`.
