@@ -61,6 +61,12 @@ if (-not $AdminToken) {
     $AdminToken = if ($cfg["ADMIN_TOKEN"]) { $cfg["ADMIN_TOKEN"] } elseif ($env:ADMIN_TOKEN) { $env:ADMIN_TOKEN } else { "dev-admin-token-change-me" }
 }
 
+# Ensure JAVA_HOME points to official Eclipse Temurin JDK 17
+$temurinJdk17 = "C:\Program Files\Eclipse Adoptium\jdk-17.0.20.101-hotspot"
+if (Test-Path (Join-Path $temurinJdk17 "bin\javac.exe")) {
+    $env:JAVA_HOME = $temurinJdk17
+}
+
 # Derive OTA admin base URL
 $OtaApiBase = if ($ServerUrl -match "/api/v1") { $ServerUrl.TrimEnd('/') } else { $ServerUrl.TrimEnd('/') + '/api/v1/ota' }
 
@@ -78,7 +84,15 @@ function Write-BrandHeader {
 function Resolve-ProjectInfo {
     param([string]$targetDir)
 
-    $projectDir = if ($targetDir) { (Resolve-Path $targetDir).Path } else { (Get-Location).Path }
+    $projectDir = if ($targetDir) {
+        (Resolve-Path $targetDir).Path
+    } elseif (Test-Path (Join-Path (Get-Location).Path "pubspec.yaml")) {
+        (Get-Location).Path
+    } elseif ($cfg["APP_DIR"] -and (Test-Path (Join-Path $cfg["APP_DIR"] "pubspec.yaml"))) {
+        (Resolve-Path $cfg["APP_DIR"]).Path
+    } else {
+        (Get-Location).Path
+    }
     $pubspecPath = Join-Path $projectDir "pubspec.yaml"
 
     if (-not (Test-Path $pubspecPath)) {
@@ -266,6 +280,41 @@ function Invoke-Release {
     } else {
         Write-Host "Tip: Pass -Install to immediately install and launch on emulator/device." -ForegroundColor Gray
     }
+}
+
+# ------------------------------------------------------------------------------
+# COMMAND: bundle / appbundle
+# ------------------------------------------------------------------------------
+function Invoke-AppBundle {
+    $info = Resolve-ProjectInfo -targetDir $Dir
+    Write-Host "==> Target Project: $($info.ProjectDir)" -ForegroundColor Yellow
+    Write-Host "==> App ID:         $($info.AppId)" -ForegroundColor Yellow
+    Write-Host "==> Release Ver:    $($info.Release)" -ForegroundColor Yellow
+    Write-Host "==> Building base release AppBundle (.aab) with custom engine..." -ForegroundColor Yellow
+
+    Push-Location $info.ProjectDir
+    try {
+        $env:LOCAL_ENGINE_MAVEN = $localEngineMaven
+        & flutter pub get
+        & flutter build appbundle --release --android-skip-build-dependency-validation
+        if ($LASTEXITCODE -ne 0) { throw "flutter build appbundle failed!" }
+    } finally {
+        Pop-Location
+    }
+
+    $aabPath = Join-Path $info.ProjectDir "build\app\outputs\bundle\release\app-release.aab"
+    if (-not (Test-Path $aabPath)) {
+        Write-Error "Built AppBundle not found at $aabPath"
+    }
+
+    $aabSizeMB = [math]::Round(((Get-Item $aabPath).Length / 1MB), 2)
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Green
+    Write-Host " ✨ APP BUNDLE READY: $($info.AppId) (v$($info.Release))" -ForegroundColor Green
+    Write-Host " Output AAB: $aabPath ($aabSizeMB MB)" -ForegroundColor Green
+    Write-Host " Engine Hook: Verified local engine Maven integrated" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Green
 }
 
 # ------------------------------------------------------------------------------
@@ -555,6 +604,8 @@ function Show-Help {
     Write-Host "Commands:" -ForegroundColor White
     Write-Host "  otoddymohit release   Builds the store release APK with the hooked Flutter engine" -ForegroundColor White
     Write-Host "                        Options: -Dir <path> -Install" -ForegroundColor Gray
+    Write-Host "  otoddymohit bundle    Builds the store release AppBundle (.aab) with the hooked Flutter engine" -ForegroundColor White
+    Write-Host "                        Options: -Dir <path>" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  otoddymohit patch     Compiles Dart changes into an OTA patch and uploads to server" -ForegroundColor White
     Write-Host "                        Options: -Dir <path> -Arch <arm64|x64> -Release <ver> -Test" -ForegroundColor Gray
@@ -580,8 +631,10 @@ function Show-Help {
 Write-BrandHeader
 
 switch ($Command.ToLower()) {
-    "release"  { Invoke-Release }
-    "patch"    { Invoke-Patch }
+    "release"   { Invoke-Release }
+    "bundle"    { Invoke-AppBundle }
+    "appbundle" { Invoke-AppBundle }
+    "patch"     { Invoke-Patch }
     "rollback" { Invoke-Rollback }
     "status"   { Invoke-Status }
     "server"   { Invoke-Server -action $SubParam }

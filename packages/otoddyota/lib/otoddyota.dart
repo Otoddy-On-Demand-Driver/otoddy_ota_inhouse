@@ -66,9 +66,28 @@ class OtoddyOTA {
     _onPatchReady = onPatchReady;
     _initialized = true;
 
-    if (autoCheck) {
-      unawaited(checkForUpdate());
-    }
+    unawaited(() async {
+      try {
+        final supportDir = await getApplicationSupportDirectory();
+        final patchDir = Directory('${supportDir.path}/inhouse_patches');
+        final releaseFile = File('${patchDir.path}/release_version');
+        if (releaseFile.existsSync()) {
+          final storedVer = (await releaseFile.readAsString()).trim();
+          if (storedVer.isNotEmpty && storedVer != releaseVersion) {
+            debugPrint('[OtoddyOTA] New release version detected ($storedVer -> $releaseVersion). Wiping stale patches.');
+            if (patchDir.existsSync()) {
+              await patchDir.delete(recursive: true);
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('[OtoddyOTA] Version check warning: $e');
+      }
+
+      if (autoCheck) {
+        await checkForUpdate();
+      }
+    }());
   }
 
   /// Manually check and download updates.
@@ -230,6 +249,9 @@ class OtoddyOTA {
       await dlResp.pipe(sink);
       await tmp.rename('${patchDir.path}/libapp.so');
       await numberFile.writeAsString('$number');
+      if (_releaseVersion != null) {
+        await File('${patchDir.path}/release_version').writeAsString(_releaseVersion!);
+      }
 
       debugPrint('[OtoddyOTA] Installed patch #$number via $base -> will apply on next launch');
       _onPatchReady?.call(number);
