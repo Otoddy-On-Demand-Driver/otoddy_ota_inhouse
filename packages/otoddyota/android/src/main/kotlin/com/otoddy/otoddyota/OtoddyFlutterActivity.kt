@@ -51,6 +51,7 @@ open class OtoddyFlutterActivity : FlutterActivity() {
             val currentUpdateTime = pInfo?.lastUpdateTime ?: 0L
 
             val lastVersionCode = prefs.getLong(KEY_LAST_VERSION_CODE, -1L)
+            val lastUpdateTime = prefs.getLong(KEY_LAST_UPDATE_TIME, 0L)
             // If base app was updated (new AAB/APK installed) or first run of this version check,
             // wipe any stale legacy patches from previous builds so new bundle changes show immediately!
             val isBaseAppUpdated = (lastVersionCode == -1L) ||
